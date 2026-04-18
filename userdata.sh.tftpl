@@ -1,0 +1,57 @@
+#!/bin/bash -xe
+
+DBPassword=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/DBPassword --with-decryption --query Parameters[0].Value --output text)
+DBUser=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/DBUser --query Parameters[0].Value --output text)
+DBName=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/DBName --query Parameters[0].Value --output text)
+DBEndpoint=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/DBEndpoint --query Parameters[0].Value --output text)
+EFSFSID=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/EFSFSID --query Parameters[0].Value --output text)
+ALBDNSNAME=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/ALBDNSNAME --query Parameters[0].Value --output text)
+
+dnf -y update
+dnf install -y wget httpd php php-mysqlnd php-fpm php-mysqli php-json php-devel stress amazon-efs-utils mariadb105
+
+systemctl enable httpd
+systemctl start httpd
+
+mkdir -p /var/www/html/wp-content
+
+echo -e "$EFSFSID:/ /var/www/html/wp-content efs _netdev,tls,iam 0 0" >> /etc/fstab
+mount -a -t efs defaults
+
+wget http://wordpress.org/latest.tar.gz -P /var/www/html
+cd /var/www/html
+tar -zxvf latest.tar.gz
+cp -rvf wordpress/* .
+rm -rf wordpress
+rm -f latest.tar.gz
+
+cp ./wp-config-sample.php ./wp-config.php
+sed -i "s/'database_name_here'/'$DBName'/g" wp-config.php
+sed -i "s/'username_here'/'$DBUser'/g" wp-config.php
+sed -i "s/'password_here'/'$DBPassword'/g" wp-config.php
+sed -i "s/'localhost'/'$DBEndpoint'/g" wp-config.php
+
+usermod -a -G apache ec2-user
+chown -R ec2-user:apache /var/www
+chmod 2775 /var/www
+find /var/www -type d -exec chmod 2775 {} \;
+find /var/www -type f -exec chmod 0664 {} \;
+
+cat > /home/ec2-user/update_wp_ip.sh << 'EOWP'
+#!/bin/bash
+source <(php -r 'require("/var/www/html/wp-config.php"); echo("DB_NAME=".DB_NAME."; DB_USER=".DB_USER."; DB_PASSWORD=".DB_PASSWORD."; DB_HOST=".DB_HOST); ')
+SQL_COMMAND="mysql -u $DB_USER -h $DB_HOST -p$DB_PASSWORD $DB_NAME -e"
+OLD_URL=$(mysql -u $DB_USER -h $DB_HOST -p$DB_PASSWORD $DB_NAME -e 'select option_value from wp_options where option_name = "siteurl";' | grep http || true)
+ALBDNSNAME=$(aws ssm get-parameters --region us-east-1 --names /A4L/Wordpress/ALBDNSNAME --query Parameters[0].Value --output text)
+if [ -n "$OLD_URL" ]; then
+  $SQL_COMMAND "UPDATE wp_options SET option_value = replace(option_value, '$OLD_URL', 'http://$ALBDNSNAME') WHERE option_name = 'home' OR option_name = 'siteurl';"
+  $SQL_COMMAND "UPDATE wp_posts SET guid = replace(guid, '$OLD_URL','http://$ALBDNSNAME');"
+  $SQL_COMMAND "UPDATE wp_posts SET post_content = replace(post_content, '$OLD_URL', 'http://$ALBDNSNAME');"
+  $SQL_COMMAND "UPDATE wp_postmeta SET meta_value = replace(meta_value,'$OLD_URL','http://$ALBDNSNAME');"
+fi
+EOWP
+
+chmod 755 /home/ec2-user/update_wp_ip.sh
+echo "/home/ec2-user/update_wp_ip.sh" >> /etc/rc.local
+chmod +x /etc/rc.d/rc.local || true
+/home/ec2-user/update_wp_ip.sh || true
